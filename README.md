@@ -45,6 +45,6 @@ node server.cjs --reset
 
 ## Typical Workflow
 
-1. In one agent (for example Claude Code), say: *"Άκου στο bridge"* (calls `peer_wait`).
-2. In the other agent (for example Antigravity), say: *"Σχεδίασε το πλάνο και συζήτησέ το με τον άλλον στο bridge μέχρι να συμφωνήσετε"* (calls `peer_exchange` with `stance: "propose"`).
+1. In one agent (for example Claude Code), say: *"Listen to the bridge"* (calls `peer_wait`).
+2. In the other agent (for example Antigravity), say: *"Make the plan and discuss with the other agent that is listening to the bridge, until you agree"* (calls `peer_exchange` with `stance: "propose"`).
 3. Both agents critique points, run measurements if needed, print round summaries in their own chat windows, and stop automatically once `stance: "agreed"` is reached.
