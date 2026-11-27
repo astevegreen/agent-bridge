@@ -1,0 +1,17 @@
+name: Feature Request
+description: Suggest an improvement to planning reviews, exports, or handoffs
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or workflow friction
+      description: What part of the Antigravity <-> Claude Code workflow could be smoother?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: false

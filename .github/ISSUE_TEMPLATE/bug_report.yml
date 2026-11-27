@@ -1,0 +1,24 @@
+name: Bug Report
+description: Report an issue with agent-bridge MCP tools, Windows/POSIX behavior, or setup
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "e.g., Windows 11, Node v24.x, Antigravity + Claude Code"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+    validations:
+      required: false

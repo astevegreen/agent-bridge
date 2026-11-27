@@ -1,7 +1,7 @@
 {
   "name": "agent-bridge",
-  "version": "1.0.0",
-  "description": "Bidirectional blocking ping-pong MCP bridge between Antigravity and Claude Code",
+  "version": "2.0.0",
+  "description": "Local-first async MCP bridge between Antigravity and Claude Code for collaborative planning reviews, Markdown plan export, and dev task handoffs",
   "main": "server.cjs",
   "scripts": {
     "start": "node server.cjs",
@@ -9,6 +9,7 @@
     "check": "node setup.cjs --check",
     "uninstall": "node setup.cjs --uninstall",
     "test": "node server.cjs --selftest",
+    "rooms": "node server.cjs --rooms",
     "status": "node server.cjs --status",
     "reset": "node server.cjs --reset"
   },
@@ -20,11 +21,12 @@
     "agent-bridge",
     "multi-agent",
     "ai-agents",
+    "local-first",
     "pair-programming"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/subamanis/agent-bridge.git"
+    "url": "https://github.com/astevegreen/agent-bridge.git"
   },
   "license": "MIT"
 }

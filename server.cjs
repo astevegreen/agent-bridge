@@ -6,14 +6,13 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 
 const SERVER_NAME = 'agent-bridge';
-const SERVER_VERSION = '1.0.0';
+const SERVER_VERSION = '2.0.0';
 const DEFAULT_ROOM = 'default';
 const DEFAULT_WAIT_SEC = 45;
 const MAX_WAIT_SEC = 120;
 const POLL_INTERVAL_MS = 180;
 const HEARTBEAT_UPDATE_MS = 4000;
 const LOCK_STALE_MS = 3000;
-const STALE_SESSION_MS = 30 * 60 * 1000;
 
 const DATA_DIR = process.env.AGENT_BRIDGE_DATA_DIR
   ? path.resolve(process.env.AGENT_BRIDGE_DATA_DIR)
@@ -36,6 +35,53 @@ function sanitizeRoomName(room) {
   return cleaned || DEFAULT_ROOM;
 }
 
+function findGitRoot(inputPath) {
+  let current = path.resolve(inputPath);
+  try {
+    if (fs.existsSync(current) && fs.statSync(current).isFile()) {
+      current = path.dirname(current);
+    }
+  } catch {}
+  let dir = current;
+  while (true) {
+    try {
+      if (fs.existsSync(path.join(dir, '.git'))) {
+        return dir;
+      }
+    } catch {}
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return current;
+}
+
+function normalizeProjectPath(projectPath) {
+  const raw = String(projectPath || '').trim();
+  if (!raw) return null;
+  let resolved = findGitRoot(raw);
+  const root = path.parse(resolved).root;
+  while (resolved.length > root.length && (resolved.endsWith('/') || resolved.endsWith('\\'))) {
+    resolved = resolved.slice(0, -1);
+  }
+  return resolved;
+}
+
+function deriveRoomFromProjectPath(projectPath) {
+  const canonical = normalizeProjectPath(projectPath);
+  if (!canonical) return DEFAULT_ROOM;
+  const hashKey =
+    process.platform === 'win32' ? canonical.toLowerCase().replace(/\\/g, '/') : canonical;
+  const baseSlug = path
+    .basename(canonical)
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24);
+  const hash = crypto.createHash('sha256').update(hashKey).digest('hex').slice(0, 6);
+  return sanitizeRoomName(`${baseSlug || 'project'}-${hash}`);
+}
+
 function normalizeAgentRole(val) {
   if (!val) return null;
   const s = String(val).trim().toLowerCase();
@@ -54,6 +100,7 @@ function parseCliArgs(argv) {
   const opts = {
     agent: normalizeAgentRole(process.env.AGENT_BRIDGE_ROLE),
     room: DEFAULT_ROOM,
+    projectPath: null,
     cliMode: null,
   };
 
@@ -68,7 +115,17 @@ function parseCliArgs(argv) {
       const val = arg === '--room' ? argv[++i] : arg.slice('--room='.length);
       if (!val || val.startsWith('-')) throw new Error(`Invalid --room value: ${val ?? ''}`);
       opts.room = sanitizeRoomName(val);
-    } else if (arg === '--status' || arg === '--reset' || arg === '--selftest') {
+    } else if (arg === '--project' || arg.startsWith('--project=')) {
+      const val = arg === '--project' ? argv[++i] : arg.slice('--project='.length);
+      if (!val || val.startsWith('-')) throw new Error(`Invalid --project value: ${val ?? ''}`);
+      opts.projectPath = normalizeProjectPath(val);
+      opts.room = deriveRoomFromProjectPath(opts.projectPath);
+    } else if (
+      arg === '--status' ||
+      arg === '--reset' ||
+      arg === '--rooms' ||
+      arg === '--selftest'
+    ) {
       opts.cliMode = arg.slice(2);
     } else if (arg === '--help' || arg === '-h') {
       opts.cliMode = 'help';
@@ -85,10 +142,16 @@ let hasActivePresence = false;
 
 function resolveContext(args = {}) {
   const selfRole = normalizeAgentRole(args.agent) || (detectedSelfRole ||= 'antigravity');
+  const projectPath = args.project_path
+    ? normalizeProjectPath(args.project_path)
+    : cliOpts.projectPath;
+  const explicitRoom = args.room ? sanitizeRoomName(args.room) : null;
+  const room = explicitRoom || (projectPath ? deriveRoomFromProjectPath(projectPath) : sanitizeRoomName(cliOpts.room));
   return {
     selfRole,
     peerRole: oppositeRole(selfRole),
-    room: sanitizeRoomName(args.room || cliOpts.room),
+    room,
+    projectPath,
   };
 }
 
@@ -188,7 +251,7 @@ function readJsonSafe(filePath) {
   }
 }
 
-function writeJsonAtomic(filePath, obj) {
+function writeTextAtomic(filePath, text) {
   const dir = path.dirname(filePath);
   if (dir === DATA_DIR) {
     ensureDirs();
@@ -198,7 +261,7 @@ function writeJsonAtomic(filePath, obj) {
   const tmpFile = `${filePath}.tmp.${process.pid}.${++tmpWriteCounter}`;
   let renamed = false;
   try {
-    fs.writeFileSync(tmpFile, JSON.stringify(obj, null, 2) + '\n', 'utf-8');
+    fs.writeFileSync(tmpFile, text, 'utf-8');
     for (let attempt = 0; attempt < 6; attempt++) {
       try {
         fs.renameSync(tmpFile, filePath);
@@ -225,6 +288,10 @@ function writeJsonAtomic(filePath, obj) {
       } catch {}
     }
   }
+}
+
+function writeJsonAtomic(filePath, obj) {
+  writeTextAtomic(filePath, JSON.stringify(obj, null, 2) + '\n');
 }
 
 function setPresence(
@@ -279,12 +346,13 @@ function isFreshWaitingPresence(
 }
 
 const STANDBY_LISTENER_HINT =
-  'To stay connected for the next bridge topic while keeping your main chat turn free to talk with the user, spawn a background listener subagent calling peer_wait(standby=true) before ending your turn.';
+  'You can now export the agreed plan with peer_export() or switch to implementation and leave task handoffs with peer_handoff().';
 
 function buildConvergedPayload(state, selfRole, peerRole, seq, instruction) {
   return {
     status: 'converged',
     room: state.room,
+    project_path: state.projectPath || undefined,
     session_id: state.sessionId,
     topic: state.topic || '(untitled)',
     self: selfRole,
@@ -330,11 +398,12 @@ function checkMutualWaitGuard(state, selfRole, peerRole, sentSeq, nowMs, standby
   };
 }
 
-function createFreshRoomState(room) {
+function createFreshRoomState(room, projectPath = null) {
   const nowMs = Date.now();
   const nowIso = new Date(nowMs).toISOString();
   return {
     room,
+    projectPath: projectPath || null,
     sessionId: `sess-${nowMs}-${crypto.randomBytes(3).toString('hex')}`,
     topic: '',
     status: 'idle',
@@ -343,6 +412,7 @@ function createFreshRoomState(room) {
     updatedMs: nowMs,
     seq: 0,
     messages: [],
+    handoffs: [],
     cursors: { antigravity: 0, claude: 0 },
     presence: {
       antigravity: { state: 'idle', sinceMs: nowMs, updatedMs: nowMs, detail: 'Idle' },
@@ -357,6 +427,8 @@ function readRoomStateRawSync(stateFile, room) {
     if (!Array.isArray(parsed.messages)) {
       return createFreshRoomState(room);
     }
+    parsed.projectPath ||= null;
+    parsed.handoffs = Array.isArray(parsed.handoffs) ? parsed.handoffs : [];
     parsed.cursors ||= { antigravity: 0, claude: 0 };
     parsed.presence ||= {};
     return parsed;
@@ -390,7 +462,10 @@ function archiveRoomStateSync(state) {
 function resetRoomStateInPlace(state, room) {
   const archivedPath = archiveRoomStateSync(state);
   const prevPresence = state.presence;
-  const fresh = createFreshRoomState(room);
+  const prevHandoffs = Array.isArray(state.handoffs) ? state.handoffs : [];
+  const prevProjectPath = state.projectPath || null;
+  const fresh = createFreshRoomState(room, prevProjectPath);
+  fresh.handoffs = prevHandoffs;
   for (const role of ['antigravity', 'claude']) {
     const p = prevPresence[role];
     if (
@@ -786,7 +861,7 @@ async function waitForPeerTurn({
 }
 
 async function handlePeerExchange(args = {}, requestId) {
-  const { selfRole, peerRole, room } = resolveContext(args);
+  const { selfRole, peerRole, room, projectPath } = resolveContext(args);
   const message = String(args.message || '').trim();
   if (!message) {
     throw new Error('Parameter "message" is required and cannot be empty.');
@@ -797,7 +872,7 @@ async function handlePeerExchange(args = {}, requestId) {
     stance = 'critique';
   }
 
-  const waitForReply = args.wait_for_reply !== false;
+  const waitForReply = args.wait_for_reply === true;
   const timeoutSec = normalizeTimeoutSec(args.timeout_sec);
   const explicitNewSession = Boolean(args.new_session);
   const trimmedTopic = String(args.topic || '').trim();
@@ -807,8 +882,10 @@ async function handlePeerExchange(args = {}, requestId) {
   const sendOutcome = mutateRoomSync(room, (state) => {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
-    const isStale = state.seq > 0 && nowMs - (state.updatedMs || 0) > STALE_SESSION_MS;
     const hasNewTopic = Boolean(trimmedTopic && state.topic && trimmedTopic !== state.topic);
+    if (projectPath && !state.projectPath) {
+      state.projectPath = projectPath;
+    }
 
     if (!explicitNewSession) {
       const unreadPayload = consumeUnreadPeerMessages(state, selfRole, 'unread_inbox_first');
@@ -816,7 +893,7 @@ async function handlePeerExchange(args = {}, requestId) {
         return { payload: unreadPayload };
       }
 
-      if (state.status === 'converged' && stance === 'agreed' && !isStale && !hasNewTopic) {
+      if (state.status === 'converged' && stance === 'agreed' && !hasNewTopic) {
         const wasIdle = state.presence[selfRole]?.state === 'idle';
         if (!wasIdle) setPresence(state, selfRole, 'idle', `Agreed at #${state.seq}`, nowMs);
         return {
@@ -835,10 +912,10 @@ async function handlePeerExchange(args = {}, requestId) {
 
     if (
       explicitNewSession ||
-      (isStale && (stance === 'propose' || getUnreadPeerMessages(state, peerRole).length === 0)) ||
       (state.status === 'converged' && (stance === 'propose' || hasNewTopic))
     ) {
       resetRoomStateInPlace(state, room);
+      if (projectPath) state.projectPath = projectPath;
     }
 
     if (trimmedTopic && (stance === 'propose' || !state.topic)) {
@@ -880,7 +957,7 @@ async function handlePeerExchange(args = {}, requestId) {
           peerRole,
           nextSeq,
           `CONSENSUS REACHED: You (${selfRole}) agreed with ${peerRole}'s latest proposal (#${nextSeq}). ` +
-            `${peerRole} has been notified and unlocked. Present the final agreed plan to the user. ${STANDBY_LISTENER_HINT}`
+            `${peerRole} has been notified. Present the final agreed plan to the user. ${STANDBY_LISTENER_HINT}`
         ),
       };
     }
@@ -903,13 +980,17 @@ async function handlePeerExchange(args = {}, requestId) {
         payload: {
           status: 'sent',
           room: state.room,
+          project_path: state.projectPath || undefined,
           session_id: state.sessionId,
+          topic: state.topic || '(untitled)',
           self: selfRole,
           peer: peerRole,
           sent_seq: nextSeq,
           stance: effectiveStance,
           note: note || undefined,
-          instruction: `Message #${nextSeq} queued for ${peerRole} without blocking. Call peer_wait() when you are ready to listen for their reply.`,
+          instruction:
+            `Message #${nextSeq} queued for ${peerRole} in room "${state.room}". ` +
+            `Switch to ${peerRole} and call peer_inbox() to review it, or call peer_wait() if you want to wait live.`,
         },
       };
     }
@@ -938,6 +1019,299 @@ async function handlePeerExchange(args = {}, requestId) {
     requestId,
     ...sendOutcome,
   });
+}
+
+function handlePeerInbox(args = {}) {
+  const { selfRole, peerRole, room, projectPath } = resolveContext(args);
+
+  return mutateRoomSync(room, (state) => {
+    let projectPathUpdated = false;
+    if (projectPath && !state.projectPath) {
+      state.projectPath = projectPath;
+      projectPathUpdated = true;
+    }
+
+    const unreadPayload = consumeUnreadPeerMessages(state, selfRole, 'message_received');
+    const latestHandoff = state.handoffs.length > 0 ? state.handoffs[state.handoffs.length - 1] : null;
+    if (unreadPayload) {
+      if (state.projectPath) unreadPayload.project_path = state.projectPath;
+      if (latestHandoff) unreadPayload.latest_handoff = latestHandoff;
+      return { payload: unreadPayload };
+    }
+
+    return {
+      skipWrite: !projectPathUpdated,
+      payload: {
+        status: 'empty',
+        room: state.room,
+        project_path: state.projectPath || undefined,
+        session_id: state.sessionId,
+        topic: state.topic || '(untitled)',
+        room_status: state.status,
+        self: selfRole,
+        peer: peerRole,
+        seq: state.seq,
+        unread_for_self: 0,
+        peer_presence: formatPresenceSummary(state.presence[peerRole]),
+        latest_handoff: latestHandoff,
+        instruction:
+          state.seq === 0
+            ? `No messages in room "${state.room}" yet. Post an initial plan with peer_exchange(stance="propose").`
+            : `No unread messages from ${peerRole} in room "${state.room}" (latest #${state.seq}, status: "${state.status}"). Use peer_status() to read full history or peer_handoff(action="latest") for dev handoff notes.`,
+      },
+    };
+  }).payload;
+}
+
+function normalizeStringList(val) {
+  if (val == null) return [];
+  if (Array.isArray(val)) {
+    return val.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  const s = String(val).trim();
+  if (!s) return [];
+  return s
+    .split(/\r?\n/)
+    .map((line) => line.replace(/^[-*]\s+/, '').trim())
+    .filter(Boolean);
+}
+
+function handlePeerHandoff(args = {}) {
+  const { selfRole, peerRole, room, projectPath } = resolveContext(args);
+  const action = String(args.action || 'latest').trim().toLowerCase();
+
+  if (action === 'post') {
+    const task = String(args.task || '').trim();
+    if (!task) {
+      throw new Error('Parameter "task" is required when action="post".');
+    }
+    const completed = normalizeStringList(args.completed);
+    const filesTouched = normalizeStringList(args.files_touched);
+    const nextSteps = normalizeStringList(args.next_steps);
+    const blockers = normalizeStringList(args.blockers);
+    const notes = String(args.notes || '').trim();
+
+    return mutateRoomSync(room, (state) => {
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      if (projectPath && !state.projectPath) {
+        state.projectPath = projectPath;
+      }
+      const entry = {
+        id: `ho-${nowMs}-${crypto.randomBytes(2).toString('hex')}`,
+        seq: state.handoffs.length + 1,
+        from: selfRole,
+        to: peerRole,
+        timestamp: nowIso,
+        task,
+        completed,
+        files_touched: filesTouched,
+        next_steps: nextSteps,
+        blockers,
+        notes: notes || undefined,
+      };
+      state.handoffs.push(entry);
+      state.updatedMs = nowMs;
+      state.updatedAt = nowIso;
+      return {
+        payload: {
+          status: 'handoff_posted',
+          room: state.room,
+          project_path: state.projectPath || undefined,
+          total_handoffs: state.handoffs.length,
+          handoff: entry,
+          instruction: `Handoff #${entry.seq} recorded for ${peerRole} in room "${state.room}". When switching to ${peerRole}, call peer_handoff(action="latest") to pick up immediately.`,
+        },
+      };
+    }).payload;
+  }
+
+  if (action === 'clear') {
+    return mutateRoomSync(room, (state) => {
+      const clearedCount = state.handoffs.length;
+      state.handoffs = [];
+      const nowMs = Date.now();
+      state.updatedMs = nowMs;
+      state.updatedAt = new Date(nowMs).toISOString();
+      return {
+        payload: {
+          status: 'handoffs_cleared',
+          room: state.room,
+          project_path: state.projectPath || undefined,
+          cleared_count: clearedCount,
+        },
+      };
+    }).payload;
+  }
+
+  const state = readRoomStateRawSync(getRoomPaths(room).stateFile, room);
+  const resolvedProject = state.projectPath || projectPath || undefined;
+
+  if (action === 'history') {
+    const limit = Math.min(50, Math.max(1, Number.isFinite(args.limit) ? Math.round(args.limit) : 10));
+    const items = state.handoffs.slice(-limit).reverse();
+    return {
+      status: 'ok',
+      room: state.room,
+      project_path: resolvedProject,
+      total_handoffs: state.handoffs.length,
+      handoffs: items,
+    };
+  }
+
+  const latest = state.handoffs.length > 0 ? state.handoffs[state.handoffs.length - 1] : null;
+  return {
+    status: 'ok',
+    room: state.room,
+    project_path: resolvedProject,
+    total_handoffs: state.handoffs.length,
+    handoff: latest,
+  };
+}
+
+function renderPlanMarkdown(state, mode) {
+  const nowIso = new Date().toISOString();
+  const topic = state.topic || '(untitled)';
+  const lines = [];
+
+  if (mode === 'handoff') {
+    const latest = state.handoffs.length > 0 ? state.handoffs[state.handoffs.length - 1] : null;
+    if (!latest) {
+      throw new Error(`No handoff notes found in room "${state.room}".`);
+    }
+    lines.push(`# Task Handoff: ${latest.task}`);
+    lines.push('');
+    lines.push(`- **Room:** \`${state.room}\``);
+    if (state.projectPath) lines.push(`- **Project:** \`${state.projectPath}\``);
+    lines.push(`- **From:** ${latest.from} → **To:** ${latest.to}`);
+    lines.push(`- **Recorded:** ${latest.timestamp}`);
+    lines.push(`- **Exported:** ${nowIso}`);
+    lines.push('');
+    if (latest.completed?.length) {
+      lines.push('## Completed');
+      for (const item of latest.completed) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (latest.files_touched?.length) {
+      lines.push('## Files Touched');
+      for (const f of latest.files_touched) lines.push(`- \`${f}\``);
+      lines.push('');
+    }
+    if (latest.next_steps?.length) {
+      lines.push('## Next Steps');
+      for (const item of latest.next_steps) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (latest.blockers?.length) {
+      lines.push('## Blockers / Open Questions');
+      for (const item of latest.blockers) lines.push(`- ${item}`);
+      lines.push('');
+    }
+    if (latest.notes) {
+      lines.push('## Notes');
+      lines.push(latest.notes);
+      lines.push('');
+    }
+    return lines.join('\n').trimEnd() + '\n';
+  }
+
+  if (state.messages.length === 0) {
+    throw new Error(`No planning messages found in room "${state.room}" to export.`);
+  }
+
+  const lastMsg = state.messages[state.messages.length - 1];
+  const nonAgreedMsgs = state.messages.filter((m) => m.stance !== 'agreed');
+  const primaryPlanMsg =
+    state.status === 'converged' && nonAgreedMsgs.length > 0
+      ? nonAgreedMsgs[nonAgreedMsgs.length - 1]
+      : lastMsg;
+
+  lines.push(`# ${topic}`);
+  lines.push('');
+  lines.push(`- **Status:** ${state.status}`);
+  lines.push(`- **Room:** \`${state.room}\``);
+  if (state.projectPath) lines.push(`- **Project:** \`${state.projectPath}\``);
+  lines.push(`- **Session:** \`${state.sessionId}\``);
+  lines.push(`- **Messages:** ${state.messages.length}`);
+  lines.push(`- **Exported:** ${nowIso}`);
+  lines.push('');
+  lines.push(state.status === 'converged' ? '## Agreed Plan' : '## Latest Plan / Revision');
+  lines.push('');
+  lines.push(primaryPlanMsg.content);
+  lines.push('');
+
+  if (state.status === 'converged' && lastMsg.stance === 'agreed' && lastMsg.seq !== primaryPlanMsg.seq) {
+    lines.push('## Final Sign-Off');
+    lines.push('');
+    lines.push(`> **${lastMsg.from}** (${lastMsg.timestamp}): ${lastMsg.content}`);
+    lines.push('');
+  }
+
+  if (mode === 'full') {
+    lines.push('## Discussion & Critique History');
+    lines.push('');
+    for (const m of state.messages) {
+      lines.push(`### #${m.seq} — ${m.from} (${m.stance}) · ${m.timestamp}`);
+      lines.push('');
+      lines.push(m.content);
+      lines.push('');
+    }
+  }
+
+  return lines.join('\n').trimEnd() + '\n';
+}
+
+function handlePeerExport(args = {}) {
+  const { room, projectPath } = resolveContext(args);
+  const modeRaw = String(args.mode || 'plan').trim().toLowerCase();
+  if (!['plan', 'full', 'handoff'].includes(modeRaw)) {
+    throw new Error(`Invalid mode "${modeRaw}". Expected "plan", "full", or "handoff".`);
+  }
+
+  const state = readRoomStateRawSync(getRoomPaths(room).stateFile, room);
+  if (projectPath && !state.projectPath) {
+    state.projectPath = projectPath;
+  }
+
+  const markdown = renderPlanMarkdown(state, modeRaw);
+  const baseProject = projectPath || state.projectPath || null;
+  const rawOut = args.output_path ? String(args.output_path).trim() : '';
+  const defaultFilename = modeRaw === 'handoff' ? 'HANDOFF.md' : 'PLAN.md';
+
+  let resolvedOut = null;
+  if (rawOut) {
+    if (path.isAbsolute(rawOut)) {
+      resolvedOut = path.resolve(rawOut);
+    } else if (baseProject) {
+      resolvedOut = path.resolve(baseProject, rawOut);
+    } else {
+      throw new Error(
+        'Relative "output_path" requires "project_path" (either passed in this call or stored on the room).'
+      );
+    }
+  } else if (baseProject) {
+    resolvedOut = path.join(baseProject, defaultFilename);
+  }
+
+  const shouldWrite = args.write !== false && Boolean(resolvedOut);
+  if (shouldWrite) {
+    if (!/\.(md|markdown)$/i.test(resolvedOut)) {
+      throw new Error(
+        `Refusing to write non-Markdown file "${resolvedOut}". Target path must end with .md or .markdown.`
+      );
+    }
+    writeTextAtomic(resolvedOut, markdown);
+  }
+
+  return {
+    status: shouldWrite ? 'exported' : 'rendered',
+    mode: modeRaw,
+    room: state.room,
+    project_path: baseProject || undefined,
+    written_path: shouldWrite ? resolvedOut : null,
+    bytes: Buffer.byteLength(markdown, 'utf-8'),
+    markdown,
+  };
 }
 
 async function handlePeerWait(args = {}, requestId) {
@@ -1035,26 +1409,70 @@ async function handlePeerWait(args = {}, requestId) {
   });
 }
 
+function listRoomsSummary(selfRole) {
+  if (!fs.existsSync(DATA_DIR)) return [];
+  const entries = fs.readdirSync(DATA_DIR);
+  const rooms = [];
+  for (const name of entries) {
+    const m = name.match(/^room-(.+)\.json$/);
+    if (!m) continue;
+    const roomName = m[1];
+    const state = readRoomStateRawSync(path.join(DATA_DIR, name), roomName);
+    rooms.push({
+      room: state.room,
+      project_path: state.projectPath || null,
+      topic: state.topic || '(untitled)',
+      room_status: state.status,
+      seq: state.seq,
+      unread_for_self: getUnreadPeerMessages(state, selfRole).length,
+      handoff_count: state.handoffs.length,
+      updated_at: state.updatedAt,
+      _updatedMs: state.updatedMs || 0,
+    });
+  }
+  rooms.sort((a, b) => b._updatedMs - a._updatedMs);
+  return rooms.map(({ _updatedMs, ...rest }) => rest);
+}
+
 function handlePeerStatus(args = {}) {
-  const { selfRole, peerRole, room } = resolveContext(args);
+  const { selfRole, peerRole, room, projectPath } = resolveContext(args);
   const action = String(args.action || 'status').trim().toLowerCase();
 
+  if (action === 'list_rooms') {
+    const rooms = listRoomsSummary(selfRole);
+    return {
+      status: 'ok',
+      self: selfRole,
+      data_dir: DATA_DIR,
+      total_rooms: rooms.length,
+      rooms,
+    };
+  }
+
   if (action === 'reset') {
-    return mutateRoomSync(room, (state) => ({
-      payload: {
-        status: 'reset_complete',
-        room,
-        archived_previous_to: resetRoomStateInPlace(state, room),
-        new_session_id: state.sessionId,
-        instruction: 'Room has been archived and reset. Ready for a new discussion.',
-      },
-    })).payload;
+    return mutateRoomSync(room, (state) => {
+      if (projectPath && !state.projectPath) state.projectPath = projectPath;
+      return {
+        payload: {
+          status: 'reset_complete',
+          room,
+          project_path: state.projectPath || undefined,
+          archived_previous_to: resetRoomStateInPlace(state, room),
+          new_session_id: state.sessionId,
+          handoffs_preserved: state.handoffs.length,
+          instruction:
+            'Planning room has been archived and reset (dev handoffs preserved). Ready for a new discussion.',
+        },
+      };
+    }).payload;
   }
 
   const state = readRoomStateRawSync(getRoomPaths(room).stateFile, room);
+  const latestHandoff = state.handoffs.length > 0 ? state.handoffs[state.handoffs.length - 1] : null;
   return {
     status: 'ok',
     room: state.room,
+    project_path: state.projectPath || projectPath || null,
     session_id: state.sessionId,
     topic: state.topic || '(untitled)',
     room_status: state.status,
@@ -1067,31 +1485,44 @@ function handlePeerStatus(args = {}) {
       antigravity: formatPresenceSummary(state.presence.antigravity),
       claude: formatPresenceSummary(state.presence.claude),
     },
+    handoff_count: state.handoffs.length,
+    latest_handoff: latestHandoff,
     messages: state.messages,
   };
 }
 
-// `room` and `agent` are intentionally omitted from MCP_TOOLS schemas so each LLM uses its configured server identity on the default room.
+const ROOM_SCOPE_PROPS = {
+  project_path: {
+    type: 'string',
+    description:
+      'Optional absolute path to the current workspace or repo. Automatically walks up to the git root and derives a deterministic per-project room ID so both agents share the same room.',
+  },
+  room: {
+    type: 'string',
+    description:
+      'Optional explicit room name override (e.g. "auth-refactor"). If omitted, derived from project_path or falls back to "default".',
+  },
+};
+
 const MCP_TOOLS = [
   {
     name: 'peer_exchange',
     description:
-      'Send your plan, point-by-point critique, benchmark results, or final agreement to the peer agent (claude or antigravity) and automatically wait for their reply.\n\n' +
-      'Debate & Planning Protocol:\n' +
-      '1. Before calling peer_exchange, always output a concise summary of your findings or counter-arguments in your own chat window so the user can follow the live discussion and intervene if needed.\n' +
-      '2. Be rigorous: verify claims against the codebase and run measurements/benchmarks when performance or behavior is in question. Never agree out of politeness.\n' +
-      '3. Address points explicitly (e.g. "Point 1: Agree. Point 2: Disagree because...").\n' +
-      '4. Set stance="propose" for an initial plan or major revision; stance="critique" whenever you have ANY objection, counter-proposal, or improvement; stance="agreed" ONLY when you have zero remaining objections or improvements to the peer\'s latest plan.\n' +
-      '5. If peer_exchange returns status="waiting_heartbeat" (because the peer is running long measurements), immediately call peer_wait() to keep waiting.\n' +
-      '6. In your main agent turn, NEVER call peer_exchange(wait_for_reply=true) or foreground peer_wait() while you have a work subagent or background task running, because blocking in a foreground bridge tool prevents your own subagents from waking you up.\n' +
-      '7. Standby Background Listener: Whenever a session reaches status="converged" (or between sessions when you want to stay connected on the bridge while keeping your main chat turn free to talk with the user), spawn a dedicated background listener subagent that calls peer_wait(standby=true) in a loop and wakes you up as soon as a peer message arrives.',
+      'Send a plan proposal, point-by-point critique, or final agreement to the peer agent (claude or antigravity). ' +
+      'Async-first by default (wait_for_reply=false): queues your message immediately and returns so you can switch harnesses at your own pace. ' +
+      'Set wait_for_reply=true only when you want an opt-in live blocking ping-pong debate.\n\n' +
+      'Planning Review Protocol:\n' +
+      '1. Pass project_path (your current workspace root) so discussions stay cleanly isolated per repository.\n' +
+      '2. Summarize key points concisely in your chat window before calling peer_exchange.\n' +
+      '3. Be rigorous: verify claims against the codebase and address points explicitly (e.g. "Point 1: Agree. Point 2: Disagree because...").\n' +
+      '4. Use stance="propose" for an initial plan or major revision; stance="critique" for objections or improvements; stance="agreed" ONLY when you agree 100% with zero further changes.',
     inputSchema: {
       type: 'object',
       properties: {
         message: {
           type: 'string',
           description:
-            'Your full message to the peer agent (plan proposal, numbered point-by-point critique, measurements, or final agreement summary).',
+            'Your full message to the peer agent (plan proposal, numbered critique, or final agreement summary).',
         },
         stance: {
           type: 'string',
@@ -1106,34 +1537,40 @@ const MCP_TOOLS = [
         new_session: {
           type: 'boolean',
           description:
-            'Set to true ONLY on the first message of a brand-new topic to archive previous messages and start a clean session.',
+            'Set to true ONLY on the first message of a brand-new topic to archive previous messages and start a clean planning session (dev handoffs are preserved).',
         },
         wait_for_reply: {
           type: 'boolean',
           description:
-            'Whether to block and wait for the peer reply (default: true). Automatically false when stance="agreed" reaches consensus.',
+            'Whether to block and wait live for the peer reply (default: false for async-first reviews; set true for live ping-pong debate). Automatically false when stance="agreed" reaches consensus.',
         },
         timeout_sec: {
           type: 'number',
           description:
-            'Seconds to wait per heartbeat cycle before returning status="waiting_heartbeat" (default: 45, max: 120).',
+            'Seconds to wait per heartbeat cycle when wait_for_reply=true (default: 45, max: 120).',
         },
+        ...ROOM_SCOPE_PROPS,
       },
       required: ['message', 'stance'],
     },
   },
   {
+    name: 'peer_inbox',
+    description:
+      'Instantly check and consume any unread messages from the peer agent without blocking. ' +
+      'Use this at the start of a planning review turn in Antigravity or Claude Code to read what the other agent posted.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...ROOM_SCOPE_PROPS,
+      },
+    },
+  },
+  {
     name: 'peer_wait',
     description:
-      'Listen and wait for the next message from the peer agent (claude or antigravity).\n\n' +
-      'When to use:\n' +
-      '1. Foreground wait: When the user tells you to listen on the bridge / wait for the other agent to send a plan, or immediately after peer_exchange / peer_wait returns status="waiting_heartbeat".\n' +
-      '2. Standby background listener (standby=true): Spawn a dedicated background subagent (e.g. a subagent with MCP access in Antigravity or Agent with run_in_background=true in Claude Code) that calls peer_wait(standby=true, timeout_sec=120) in a loop on waiting_heartbeat and returns immediately on message_received or converged. This keeps your main chat turn free to talk with the user while automatically waking you up when the peer speaks.\n\n' +
-      'When NOT to use:\n' +
-      '- In your main agent turn, NEVER call foreground peer_wait while you have a work subagent or background task running.\n' +
-      '- NEVER call peer_wait when you already received the peer\'s latest message and it is YOUR turn to reply (finish your work/subagents first, then call peer_exchange).\n' +
-      '- NEVER call peer_wait if peer_wait returns status="your_turn_to_reply" or status="mutual_wait_prevented".\n\n' +
-      'When a message arrives: summarize the peer\'s points for the user in your chat window, perform any needed checks/measurements, and reply with peer_exchange (unless status="converged").',
+      'Opt-in live blocking wait for the next message from the peer agent (claude or antigravity). ' +
+      'For normal async reviews, prefer peer_inbox() instead. Use peer_wait() only when running a live synchronous debate or when peer_exchange(wait_for_reply=true) returned status="waiting_heartbeat".',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1145,24 +1582,103 @@ const MCP_TOOLS = [
         standby: {
           type: 'boolean',
           description:
-            'Set to true when called from a background listener subagent so both agents can stay on standby between sessions without triggering mutual_wait_prevented.',
+            'Set to true when called from a background listener subagent so both agents can stay on standby between live sessions without triggering mutual_wait_prevented.',
         },
+        ...ROOM_SCOPE_PROPS,
+      },
+    },
+  },
+  {
+    name: 'peer_handoff',
+    description:
+      'Record or read lightweight implementation handoff notes when alternating between Antigravity and Claude Code on individual tasks. ' +
+      'Stored separately from planning messages in the same project room so resetting a planning session never wipes active dev handoffs.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['latest', 'post', 'history', 'clear'],
+          description:
+            '"latest" (default) returns the most recent handoff; "post" records a new handoff; "history" lists recent handoffs; "clear" clears handoffs in this room.',
+        },
+        task: {
+          type: 'string',
+          description: 'Short task title or summary (required when action="post").',
+        },
+        completed: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of what was completed in this turn.',
+        },
+        files_touched: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of repo-relative or absolute file paths created/modified.',
+        },
+        next_steps: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Concrete next steps for the next agent picking up the work.',
+        },
+        blockers: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Any open questions, failing tests, or blockers.',
+        },
+        notes: {
+          type: 'string',
+          description: 'Optional extra context or verification command output.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Max handoffs to return when action="history" (default: 10, max: 50).',
+        },
+        ...ROOM_SCOPE_PROPS,
+      },
+    },
+  },
+  {
+    name: 'peer_export',
+    description:
+      'Render and optionally write the converged plan, full critique history, or latest dev handoff to a Markdown file (default: <project_path>/PLAN.md or HANDOFF.md).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['plan', 'full', 'handoff'],
+          description:
+            '"plan" (default) exports the agreed/latest plan with metadata; "full" includes the full numbered critique transcript; "handoff" exports the latest dev handoff.',
+        },
+        output_path: {
+          type: 'string',
+          description:
+            'Optional target .md/.markdown path (absolute, or relative to project_path). Defaults to <project_path>/PLAN.md (or HANDOFF.md for mode="handoff").',
+        },
+        write: {
+          type: 'boolean',
+          description:
+            'Whether to write the rendered Markdown to output_path (default: true when a target path is resolved; set false to return Markdown only).',
+        },
+        ...ROOM_SCOPE_PROPS,
       },
     },
   },
   {
     name: 'peer_status',
     description:
-      'Inspect the current bridge room state, peer presence (waiting, working, idle), and full message transcript, or reset/archive the room.',
+      'Inspect the current bridge room state, peer presence, full message transcript, and latest handoff; list all active project rooms; or archive/reset the planning session.',
     inputSchema: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
-          enum: ['status', 'reset'],
+          enum: ['status', 'list_rooms', 'reset'],
           description:
-            '"status" (default) returns presence and full transcript; "reset" archives the current transcript and clears the room.',
+            '"status" (default) returns presence, transcript, and latest handoff; "list_rooms" lists all rooms in data/; "reset" archives the planning transcript and clears messages (preserving handoffs).',
         },
+        ...ROOM_SCOPE_PROPS,
       },
     },
   },
@@ -1245,8 +1761,14 @@ async function handleJsonRpcMessage(msg) {
 
       if (toolName === 'peer_exchange') {
         resultPayload = await handlePeerExchange(toolArgs, id);
+      } else if (toolName === 'peer_inbox') {
+        resultPayload = handlePeerInbox(toolArgs);
       } else if (toolName === 'peer_wait') {
         resultPayload = await handlePeerWait(toolArgs, id);
+      } else if (toolName === 'peer_handoff') {
+        resultPayload = handlePeerHandoff(toolArgs);
+      } else if (toolName === 'peer_export') {
+        resultPayload = handlePeerExport(toolArgs);
       } else if (toolName === 'peer_status') {
         resultPayload = handlePeerStatus(toolArgs);
       } else {
@@ -1430,18 +1952,32 @@ async function runSelfTest() {
   };
   const send = (agent, stance, message, extra = {}) =>
     handlePeerExchange({ room: testRoom, agent, stance, message, timeout_sec: 10, ...extra });
+  const tempProjectDir = path.join(DATA_DIR, `selftest_proj_${process.pid}`);
+  const tempSubDir = path.join(tempProjectDir, 'src', 'nested');
+  let derivedProjectRoom = null;
 
   try {
-    // 1. Reset room + verify first-turn "agreed" downgrade to "propose" (blocking + non-blocking) + archive on reset
+    // 1. Reset room + verify async-first default (wait_for_reply defaults to false) + first-turn "agreed" downgrade + archive on reset
     check(handlePeerStatus({ room: testRoom, action: 'reset' }).status === 'reset_complete', 'Reset');
-    const down = await send('antigravity', 'agreed', 'Premature agreed', { wait_for_reply: false });
-    check(down.status === 'sent' && down.stance === 'propose' && down.note, 'Downgrade', down);
+    const down = await send('antigravity', 'agreed', 'Premature agreed');
+    check(down.status === 'sent' && down.stance === 'propose' && down.note, 'AsyncDefaultAndDowngrade', down);
+    const inbox1 = handlePeerInbox({ room: testRoom, agent: 'claude' });
+    check(
+      inbox1.status === 'message_received' && inbox1.peer_message?.seq === 1,
+      'PeerInboxConsume',
+      inbox1
+    );
+    const inboxEmpty = handlePeerInbox({ room: testRoom, agent: 'claude' });
+    check(inboxEmpty.status === 'empty' && inboxEmpty.unread_for_self === 0, 'PeerInboxEmpty', inboxEmpty);
     const arch = handlePeerStatus({ room: testRoom, action: 'reset' });
     check(arch.archived_previous_to && fs.existsSync(arch.archived_previous_to), 'Archive', arch);
 
-    // 2. Multi-round concurrent debate (#1 propose -> #2 critique -> #3 critique -> #4 agreed)
+    // 2. Opt-in live concurrent debate (wait_for_reply: true) (#1 propose -> #2 critique -> #3 critique -> #4 agreed)
     const claudeWait1 = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
-    const agyEx1 = send('antigravity', 'agreed', 'Plan v1: LRU + TTL 60s', { topic: 'Cache' });
+    const agyEx1 = send('antigravity', 'agreed', 'Plan v1: LRU + TTL 60s', {
+      topic: 'Cache',
+      wait_for_reply: true,
+    });
     const cRecv1 = await claudeWait1;
     check(
       cRecv1.status === 'message_received' &&
@@ -1452,7 +1988,7 @@ async function runSelfTest() {
       cRecv1
     );
 
-    const claudeEx1 = send('claude', 'critique', 'Point 2 disagree: TTL 300s');
+    const claudeEx1 = send('claude', 'critique', 'Point 2 disagree: TTL 300s', { wait_for_reply: true });
     const aRecv1 = await agyEx1;
     check(
       aRecv1.status === 'message_received' && aRecv1.peer_message?.seq === 2 && Boolean(aRecv1.note),
@@ -1460,11 +1996,11 @@ async function runSelfTest() {
       aRecv1
     );
 
-    const agyEx2 = send('antigravity', 'critique', 'Plan v2: TTL 300s + hook');
+    const agyEx2 = send('antigravity', 'critique', 'Plan v2: TTL 300s + hook', { wait_for_reply: true });
     const cRecv2 = await claudeEx1;
     check(cRecv2.status === 'message_received' && cRecv2.peer_message?.seq === 3, 'cRecv2', cRecv2);
 
-    const cAgree = await send('claude', 'agreed', '100% agreed with Plan v2');
+    const cAgree = await send('claude', 'agreed', '100% agreed with Plan v2', { wait_for_reply: true });
     const aConv = await agyEx2;
     check(cAgree.status === 'converged' && aConv.status === 'converged', 'Converge', { cAgree, aConv });
 
@@ -1473,16 +2009,14 @@ async function runSelfTest() {
     check(dupAgree.status === 'converged' && dupAgree.sent_seq === 4, 'IdempotentAgree', dupAgree);
 
     // 3. Unread inbox guard (multi-message batch #5+#6 and converged/agreed #7) + unilateral agreed downgrade
-    await send('claude', 'critique', 'Extra check on memory cap (#5)', { wait_for_reply: false });
-    const selfAgreeDown = await send('claude', 'agreed', 'Unilateral self-agree (#6)', {
-      wait_for_reply: false,
-    });
+    await send('claude', 'critique', 'Extra check on memory cap (#5)');
+    const selfAgreeDown = await send('claude', 'agreed', 'Unilateral self-agree (#6)');
     check(
       selfAgreeDown.status === 'sent' && selfAgreeDown.stance === 'critique' && Boolean(selfAgreeDown.note),
       'UnilateralAgreeDowngrade',
       selfAgreeDown
     );
-    const guard1 = await send('antigravity', 'critique', 'Blind send', { wait_for_reply: false });
+    const guard1 = await send('antigravity', 'critique', 'Blind send');
     check(
       guard1.status === 'unread_inbox_first' &&
         guard1.peer_message?.seq === 6 &&
@@ -1491,10 +2025,10 @@ async function runSelfTest() {
       guard1
     );
 
-    const send7 = await send('antigravity', 'agreed', 'Agreed on memory cap (#7)', { wait_for_reply: false });
+    const send7 = await send('antigravity', 'agreed', 'Agreed on memory cap (#7)');
     check(send7.status === 'converged' && send7.sent_seq === 7, 'Send7', send7);
 
-    const guard2 = await send('claude', 'critique', 'Blind send before #7', { wait_for_reply: false });
+    const guard2 = await send('claude', 'critique', 'Blind send before #7');
     check(
       guard2.status === 'unread_inbox_first' &&
         guard2.peer_message?.seq === 7 &&
@@ -1503,11 +2037,10 @@ async function runSelfTest() {
       guard2
     );
 
-    // 4. Stale session (STALE_SESSION_MS) must NOT wipe unread messages when either sender or receiver calls handlePeerWait
+    // 4. Async sessions stay intact over long idle gaps (no 30-min auto-wipe) + passive wait on new_session
     const passiveWait = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
     await send('antigravity', 'propose', 'New topic plan (#1)', {
       new_session: true,
-      wait_for_reply: false,
     });
     const passiveRecv = await passiveWait;
     check(
@@ -1518,18 +2051,17 @@ async function runSelfTest() {
       passiveRecv
     );
 
-    await send('antigravity', 'propose', 'Stale topic plan (#1)', {
+    await send('antigravity', 'propose', 'Long idle async plan (#1)', {
       new_session: true,
-      wait_for_reply: false,
     });
     mutateRoomSync(testRoom, (s) => {
-      s.updatedMs -= STALE_SESSION_MS + 5000;
+      s.updatedMs -= 48 * 60 * 60 * 1000;
       return {};
     });
-    const senderStaleWait = await handlePeerWait({ room: testRoom, agent: 'antigravity', timeout_sec: 1 });
-    check(senderStaleWait.status === 'waiting_heartbeat' && senderStaleWait.sent_seq === 1, 'SenderStaleWait', senderStaleWait);
-    const staleRecv = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 2 });
-    check(staleRecv.status === 'message_received' && staleRecv.peer_message?.seq === 1, 'StaleUnread', staleRecv);
+    const senderIdleWait = await handlePeerWait({ room: testRoom, agent: 'antigravity', timeout_sec: 1 });
+    check(senderIdleWait.status === 'waiting_heartbeat' && senderIdleWait.sent_seq === 1, 'SenderIdleWait', senderIdleWait);
+    const idleRecv = handlePeerInbox({ room: testRoom, agent: 'claude' });
+    check(idleRecv.status === 'message_received' && idleRecv.peer_message?.seq === 1, 'AsyncIdlePreserved', idleRecv);
     const wrongTurnWait = await handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
     check(
       wrongTurnWait.status === 'your_turn_to_reply' && wrongTurnWait.last_peer_seq === 1,
@@ -1538,7 +2070,7 @@ async function runSelfTest() {
     );
 
     // 5. Room reset while waiting in active session unlocks waiter with session_reset
-    await send('claude', 'critique', 'Waiting for reply (#2)', { wait_for_reply: false });
+    await send('claude', 'critique', 'Waiting for reply (#2)');
     const waitResetP = handlePeerWait({ room: testRoom, agent: 'claude', timeout_sec: 10 });
     handlePeerStatus({ room: testRoom, action: 'reset' });
     const resetWake = await waitResetP;
@@ -1641,20 +2173,109 @@ async function runSelfTest() {
       { rec, corruptBackups }
     );
 
+    // 8. Project-scoped room derivation (git root walk-up) + list_rooms + peer_handoff persistence + peer_export guardrails
+    fs.mkdirSync(path.join(tempProjectDir, '.git'), { recursive: true });
+    fs.mkdirSync(tempSubDir, { recursive: true });
+    const roomFromRoot = deriveRoomFromProjectPath(tempProjectDir);
+    const roomFromSub = deriveRoomFromProjectPath(tempSubDir);
+    derivedProjectRoom = roomFromRoot;
+    check(roomFromRoot === roomFromSub && roomFromRoot.includes('selftest_proj_'), 'GitRootRoomDerivation', {
+      roomFromRoot,
+      roomFromSub,
+    });
+
+    const projPost = await handlePeerExchange({
+      project_path: tempProjectDir,
+      agent: 'antigravity',
+      stance: 'propose',
+      topic: 'Export Test Plan',
+      message: '1. Build API\n2. Add tests',
+    });
+    check(projPost.status === 'sent' && projPost.room === roomFromRoot, 'ProjectPost', projPost);
+
+    const projInbox = handlePeerInbox({ project_path: tempSubDir, agent: 'claude' });
+    check(projInbox.status === 'message_received' && projInbox.room === roomFromRoot, 'ProjectSubdirInbox', projInbox);
+
+    const projAgree = await handlePeerExchange({
+      project_path: tempSubDir,
+      agent: 'claude',
+      stance: 'agreed',
+      message: 'Looks great, ready to build.',
+    });
+    check(projAgree.status === 'converged', 'ProjectConverge', projAgree);
+
+    const listed = handlePeerStatus({ agent: 'antigravity', action: 'list_rooms' });
+    check(
+      listed.rooms.some((r) => r.room === roomFromRoot && r.room_status === 'converged'),
+      'ListRooms',
+      listed
+    );
+
+    const hoPost = handlePeerHandoff({
+      project_path: tempProjectDir,
+      agent: 'antigravity',
+      action: 'post',
+      task: 'Implement auth middleware',
+      completed: ['Added JWT verifier'],
+      files_touched: ['src/auth.ts'],
+      next_steps: ['Wire middleware into routes'],
+    });
+    check(hoPost.status === 'handoff_posted' && hoPost.handoff.seq === 1, 'HandoffPost', hoPost);
+
+    // Export plan, full transcript, and handoff to Markdown
+    const expPlan = handlePeerExport({ project_path: tempProjectDir, mode: 'plan' });
+    const expFull = handlePeerExport({
+      project_path: tempProjectDir,
+      mode: 'full',
+      output_path: 'docs/full-review.md',
+    });
+    const expHandoff = handlePeerExport({ project_path: tempProjectDir, mode: 'handoff' });
+    check(
+      expPlan.status === 'exported' &&
+        fs.existsSync(expPlan.written_path) &&
+        fs.readFileSync(expPlan.written_path, 'utf-8').includes('## Agreed Plan') &&
+        expFull.status === 'exported' &&
+        fs.readFileSync(expFull.written_path, 'utf-8').includes('## Discussion & Critique History') &&
+        expHandoff.status === 'exported' &&
+        fs.readFileSync(expHandoff.written_path, 'utf-8').includes('Implement auth middleware'),
+      'PeerExportModes',
+      { expPlan: expPlan.written_path, expFull: expFull.written_path, expHandoff: expHandoff.written_path }
+    );
+
+    // Verify non-Markdown write refusal
+    let rejectedNonMd = false;
+    try {
+      handlePeerExport({ project_path: tempProjectDir, output_path: 'server.js' });
+    } catch {
+      rejectedNonMd = true;
+    }
+    check(rejectedNonMd, 'PeerExportMdGuardrail');
+
+    // Resetting planning session must preserve dev handoffs
+    const projReset = handlePeerStatus({ project_path: tempProjectDir, action: 'reset' });
+    const hoLatest = handlePeerHandoff({ project_path: tempProjectDir, action: 'latest' });
+    check(
+      projReset.handoffs_preserved === 1 && hoLatest.handoff?.task === 'Implement auth middleware',
+      'HandoffPreservedAcrossReset',
+      { projReset, hoLatest }
+    );
+
     console.log(
       JSON.stringify(
         {
           selftest: 'PASSED',
+          async_default_and_inbox_verified: true,
           convergence_verified: true,
           idempotent_agreed_verified: true,
           unread_inbox_guard_verified: true,
-          stale_unread_preservation_verified: true,
+          async_idle_preservation_verified: true,
           session_reset_wake_verified: true,
           cancel_safety_verified: true,
           no_op_wait_zero_writes_verified: true,
           wrong_turn_and_mutual_wait_guards_verified: true,
           standby_and_cross_process_supersede_verified: true,
           corrupt_recovery_verified: true,
+          project_rooms_handoff_and_export_verified: true,
         },
         null,
         2
@@ -1664,9 +2285,21 @@ async function runSelfTest() {
     try {
       if (fs.existsSync(stateFile)) fs.unlinkSync(stateFile);
       if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile);
+      if (derivedProjectRoom) {
+        const dp = getRoomPaths(derivedProjectRoom);
+        if (fs.existsSync(dp.stateFile)) fs.unlinkSync(dp.stateFile);
+        if (fs.existsSync(dp.lockFile)) fs.unlinkSync(dp.lockFile);
+      }
+      if (fs.existsSync(tempProjectDir)) {
+        fs.rmSync(tempProjectDir, { recursive: true, force: true });
+      }
       if (fs.existsSync(ARCHIVE_DIR)) {
         for (const f of fs.readdirSync(ARCHIVE_DIR)) {
-          if (f.startsWith(`${testRoom}-`) || f.startsWith(`corrupt-${testRoom}-`)) {
+          if (
+            f.startsWith(`${testRoom}-`) ||
+            f.startsWith(`corrupt-${testRoom}-`) ||
+            (derivedProjectRoom && f.startsWith(`${derivedProjectRoom}-`))
+          ) {
             fs.unlinkSync(path.join(ARCHIVE_DIR, f));
           }
         }
@@ -1682,12 +2315,13 @@ async function runCliMode() {
         'Usage: node server.cjs [options]',
         '',
         'MCP Stdio Mode (default):',
-        '  node server.cjs --agent antigravity [--room default]',
-        '  node server.cjs --agent claude [--room default]',
+        '  node server.cjs --agent antigravity [--room default | --project <path>]',
+        '  node server.cjs --agent claude [--room default | --project <path>]',
         '',
         'CLI Diagnostics Mode:',
-        '  node server.cjs --status [--room default]',
-        '  node server.cjs --reset [--room default]',
+        '  node server.cjs --rooms',
+        '  node server.cjs --status [--room default | --project <path>]',
+        '  node server.cjs --reset [--room default | --project <path>]',
         '  node server.cjs --selftest',
         '  node server.cjs --help',
         '',
@@ -1704,9 +2338,22 @@ async function runCliMode() {
     return;
   }
 
+  if (cliOpts.cliMode === 'rooms') {
+    console.log(JSON.stringify(handlePeerStatus({ action: 'list_rooms' }), null, 2));
+    return;
+  }
+
   if (cliOpts.cliMode === 'status' || cliOpts.cliMode === 'reset') {
     console.log(
-      JSON.stringify(handlePeerStatus({ room: cliOpts.room, action: cliOpts.cliMode }), null, 2)
+      JSON.stringify(
+        handlePeerStatus({
+          room: cliOpts.room,
+          project_path: cliOpts.projectPath,
+          action: cliOpts.cliMode,
+        }),
+        null,
+        2
+      )
     );
   }
 }
